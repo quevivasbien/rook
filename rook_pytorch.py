@@ -10,6 +10,7 @@ import torch
 import torch.nn as nn
 
 
+LR = 0.05  # the learning rate
 VERBOSE = False
 
 def printv(text):
@@ -21,7 +22,7 @@ class Card:
 
     def __init__(self, color, number):
         self.color = color
-        assert self.color in ['red', 'yellow', 'green', 'black']
+        assert self.color in ('red', 'yellow', 'green', 'black')
         self.number = number
         assert self.number in range(1, 15)
         if self.number == 5:
@@ -41,6 +42,15 @@ class Rook(Card):
         self.number = 0
         self.points = 20
         
+
+def color_to_one_hot(color):
+    """Returns a 4-d one-hot vector representing one of the four colors
+    """
+    assert color in ('red', 'yellow', 'green', 'black')
+    out_vec = torch.zeros(4)
+    i = 0 if color == 'red' else 1 if color == 'yellow' else 2 if color == 'green' else 3
+    out_vec[i] = 1
+    return out_vec
 
 
 def vectorize_cards(cards):
@@ -92,12 +102,15 @@ class ChooseCard(nn.Module):
         self.softmax = nn.Softmax(dim=-1)
         self.zero_grad()
     
+    def get_zeros(self):
+        return [torch.zeros_like(p) for p in self.parameters()]
+    
     def get_grads(self):
         try:
-            return [p.grad.detach.clone() for p in self.parameters()]
+            return [p.grad.detach().clone() for p in self.parameters()]
         except AttributeError:
             # gradients do not exist, return tensors of zeros instead
-            return [torch.zeros_like(p) for p in self.parameters()]
+            return self.get_zeros()
     
     def forward(self, input_features):
         x = self.relu(self.l1(input_features))
@@ -110,6 +123,19 @@ class ChooseCard(nn.Module):
 class Game:
 
     def __init__(self):
+        # set up the game state to be ready for the start of the game
+        self.reset()
+        # set up card choice neural nets
+        self.firstPlayerChooseCard = ChooseCard(118)  # input dim is 4 + 2*57
+        self.grad1 = self.firstPlayerChooseCard.get_grads()
+        self.secondPlayerChooseCard = ChooseCard(175)  # input dim is 4 + 3*57
+        self.grad2 = self.secondPlayerChooseCard.get_grads()
+        self.thirdPlayerChooseCard = ChooseCard(175)
+        self.grad3 = self.thirdPlayerChooseCard.get_grads()
+        self.fourthPlayerChooseCard = ChooseCard(118)
+        self.grad4 = self.fourthPlayerChooseCard.get_grads()
+    
+    def reset(self):
         # create list of all cards in the deck
         cards = [Card(color, number) for color in ['red', 'yellow', 'green', 'black'] for number in range(1, 15)] \
                 + [Rook()]
@@ -121,26 +147,20 @@ class Game:
         self.bid_winner, self.bid_amount = self.bid()
         # take widow and choose trump color
         self.trump = self.choose_trump()
+        self.trump_vec = color_to_one_hot(self.trump)
         self.score0 = 0  # score for players 0 and 2 (team 0)
         self.score1 = 0  # score for players 1 and 3 (team 1)
         self.cards_balance = 0  # difference of cards taken by team 0 and by team 1
-        # set up card choice neural nets
-        self.firstPlayerChooseCard = ChooseCard(114)
-        self.grad1 = self.firstPlayerChooseCard.get_grads()
-        self.secondPlayerChooseCard = ChooseCard(171)
-        self.grad2 = self.secondPlayerChooseCard.get_grads()
-        self.thirdPlayerChooseCard = ChooseCard(171)
-        self.grad3 = self.thirdPlayerChooseCard.get_grads()
-        self.fourthPlayerChooseCard = ChooseCard(114)
-        self.grad4 = self.fourthPlayerChooseCard.get_grads()
 
     def bid(self):
+        # TODO: Use ML for bidding
         # for now just always give to player 0 for random amount
         bid_winner = 0
         bid_amount = random.choice([100 + x*5 for x in range(21)])
         return bid_winner, bid_amount
 
     def choose_trump(self):
+        # TODO: Use ML for choosing trump
         # use a simple strategy for now: choose trump as color with most cards
         # put into widow lowest cards of non-trump colors
         all_cards = self.players[self.bid_winner] + self.widow
@@ -169,12 +189,29 @@ class Game:
                 suite = self.trump
                 highest_number = cards[i].number
                 winner = i
-            elif cards[i].color == suite and (cards[i].number > highest_number or cards[i].number == 1):
+            elif cards[i].color == suite and ((cards[i].number > highest_number and highest_number != 1) \
+                                              or cards[i].number == 1):
                 highest_number = cards[i].number
                 winner = i
         points = sum(card.points for card in cards)
         return player_order[winner], points
-
+    
+    def get_valid_cards(self, first_card, cards_in_hand):
+        """Determines which cards in a player's hand can be legally played given the first card played in a round.
+        first card is a Card object.
+        cards_in_hand is a list of Card objects.
+        returns a 57d one-hot vector representing legal plays.
+        """
+        same_color_cards = [card for card in cards_in_hand if \
+                            card.color == first_card.color or \
+                            (isinstance(card, Rook) and first_card.color == self.trump)]
+        if same_color_cards:
+            return vectorize_cards(same_color_cards)
+        trump_cards = [card for card in cards_in_hand if card.color == self.trump or isinstance(card, Rook)]
+        if trump_cards:
+            return vectorize_cards(trump_cards)
+        return vectorize_cards(cards_in_hand)
+        
     def choose_card(self, cards, player_order):
         num_cards_down = len(cards)
         player = player_order[num_cards_down]
@@ -184,72 +221,78 @@ class Game:
             # cards already played
             # cards that can be played still
             # what color is trump
-            # TODO: If player did not take bid, include cards in widow in possible cards to be played still
         cards_in_hand = vectorize_cards(self.players[player])
         if num_cards_down == 0:
             possible_plays = vectorize_cards(sum(
                         (self.players[p] for p in player_order[1:]), []
                     ))
-            input_features = torch.cat((cards_in_hand, possible_plays))
+            if player != self.bid_winner:
+                possible_plays += vectorize_cards(self.widow)
+            input_features = torch.cat((self.trump_vec, cards_in_hand, possible_plays))
             card_choice_vec = self.firstPlayerChooseCard(input_features)
-            # update gradient
-            card_choice_vec.sum().backward()
+        elif num_cards_down == 1:
+            possible_plays = vectorize_cards(sum(
+                        (self.players[p] for p in player_order[2:]), []
+                    ))
+            if player != self.bid_winner:
+                possible_plays += vectorize_cards(self.widow)
+            cards_down = vectorize_cards(cards)
+            input_features = torch.cat((self.trump_vec, cards_in_hand, possible_plays, cards_down))
+            card_choice_vec = self.secondPlayerChooseCard(input_features)
+        elif num_cards_down == 2:
+            possible_plays = vectorize_cards(self.players[player_order[3]])
+            if player != self.bid_winner:
+                possible_plays += vectorize_cards(self.widow)
+            cards_down = vectorize_cards(cards)
+            input_features = torch.cat((self.trump_vec, cards_in_hand, possible_plays, cards_down))
+            card_choice_vec = self.thirdPlayerChooseCard(input_features)
+        elif num_cards_down == 3:
+            cards_down = vectorize_cards(cards)
+            input_features = torch.cat((self.trump_vec, cards_in_hand, cards_down))
+            card_choice_vec = self.fourthPlayerChooseCard(input_features)
+        # determine the best available card from card_choice_vec
+        available_plays = card_choice_vec.detach().clone()
+        if num_cards_down == 0:
+            available_plays *= cards_in_hand
+        else:
+            available_plays *= self.get_valid_cards(cards[0], self.players[player])
+        best_card_index = available_plays.argmax().item()
+        # update the gradients determining that card
+        card_choice_vec[best_card_index].backward()
+        if num_cards_down == 0:
             new_grads = self.firstPlayerChooseCard.get_grads()
             for i, g in enumerate(self.grad1):
                 g += new_grads[i]
             self.firstPlayerChooseCard.zero_grad()
         elif num_cards_down == 1:
-            possible_plays = vectorize_cards(sum(
-                        (self.players[p] for p in player_order[2:]), []
-                    ))
-            cards_down = vectorize_cards(cards)
-            input_features = torch.cat((cards_in_hand, possible_plays, cards_down))
-            card_choice_vec = self.secondPlayerChooseCard(input_features)
-            # update gradient
-            card_choice_vec.sum().backward()
             new_grads = self.secondPlayerChooseCard.get_grads()
             for i, g in enumerate(self.grad2):
                 g += new_grads[i]
             self.secondPlayerChooseCard.zero_grad()
         elif num_cards_down == 2:
-            possible_plays = vectorize_cards(self.players[player_order[3]])
-            cards_down = vectorize_cards(cards)
-            input_features = torch.cat((cards_in_hand, possible_plays, cards_down))
-            card_choice_vec = self.thirdPlayerChooseCard(input_features)
-            # update gradient
-            card_choice_vec.sum().backward()
             new_grads = self.thirdPlayerChooseCard.get_grads()
             for i, g in enumerate(self.grad3):
                 g += new_grads[i]
             self.thirdPlayerChooseCard.zero_grad()
         elif num_cards_down == 3:
-            cards_down = vectorize_cards(cards)
-            input_features = torch.cat((cards_in_hand, cards_down))
-            card_choice_vec = self.fourthPlayerChooseCard(input_features)
-            # update gradient
-            card_choice_vec.sum().backward()
             new_grads = self.fourthPlayerChooseCard.get_grads()
             for i, g in enumerate(self.grad4):
                 g += new_grads[i]
             self.fourthPlayerChooseCard.zero_grad()
-        # get best available card from card_choice_vec
-        available_plays = card_choice_vec.detach()
-        available_plays[cards_in_hand == 0] = 0
-        choice_dict = card_from_index(available_plays.argmax().item()).__dict__
+        # interpret the best card index as a Card and update the game state
+        choice_dict = card_from_index(best_card_index).__dict__
         for i, card in enumerate(self.players[player]):
             if card.__dict__ == choice_dict:
                 return self.players[player].pop(i)
         assert False, f'shouldn\'t arrive here! player is {player} and card is {choice_dict}'
-            
-
-
 
     def play_hand(self, starting_player):
         player_order = [(i+starting_player) % 4 for i in range(4)]
         cards = []
         for player in player_order:
             cards.append(self.choose_card(cards, player_order))
-            printv(f'player {player} plays {cards[-1].color} {cards[-1].number}')
+            printv(f'player {player} plays rook' if isinstance(cards[-1], Rook) else \
+                   f'player {player} plays {cards[-1].color} {cards[-1].number}')
         winner, points = self.resolve_hand(cards, player_order)
         if winner % 2 == 0:
             self.score0 += points
@@ -257,9 +300,12 @@ class Game:
             self.score1 += points
         return winner
 
-    def play(self):
+    def play(self, train=False):
+        printv(f'Player {self.bid_winner} won the bid for {self.bid_amount}.')
+        printv(f'{self.trump} is trump')
         starting_player = self.bid_winner
-        for _ in range(13):
+        for i in range(13):
+            printv(f'Round {i+1}:')
             starting_player = self.play_hand(starting_player)
         # take points from widow
         if starting_player % 2 == 0:
@@ -272,7 +318,40 @@ class Game:
             self.score0 += 20
         else:
             self.score1 += 20
+        # subtract bid amount if the bid winner goes set
+        if self.bid_winner == 0 or self.bid_winner == 2 and self.score0 < self.bid_amount:
+            self.score0 -= self.bid_amount
+        elif self.bid_winner == 1 or self.bid_winner == 3 and self.score1 < self.bid_amount:
+            self.score1 -= self.bid_amount
+        printv('Even team wins.' if self.score0 > self.score1 else \
+               'Odd team wins.' if self.score0 < self.score1 else \
+               'It\'s a tie.')
+        if train:
+            # update neural net parameters based on acccumulated gradients & who won the game
+            # if a player won, reinforce the params based on the grad, otherwise do opposite
+            sign = 1 if self.score0 > self.score1 else -1 if self.score0 < self.score1 else 0
+            for p, grad in zip(self.firstPlayerChooseCard.parameters(), self.grad1):
+                p.data += sign * LR * grad
+            self.grad1 = self.firstPlayerChooseCard.get_zeros()
+            for p, grad in zip(self.secondPlayerChooseCard.parameters(), self.grad2):
+                p.data -= sign * LR * grad
+            self.grad2 = self.secondPlayerChooseCard.get_zeros()
+            for p, grad in zip(self.thirdPlayerChooseCard.parameters(), self.grad3):
+                p.data += sign * LR * grad
+            self.grad3 = self.thirdPlayerChooseCard.get_zeros()
+            for p, grad in zip(self.fourthPlayerChooseCard.parameters(), self.grad4):
+                p.data -= sign * LR * grad
+            self.grad4 = self.fourthPlayerChooseCard.get_zeros()
+        # reset the game state to play again
+        self.reset()
+    
+    def train(self, rounds=100):
+        for i in range(rounds):
+            self.play(train=True)
+            if (i+1) % 100 == 0 or (i+1) == rounds:
+                print(f'Completed {i+1} / {rounds} training rounds.')
+
 
 
 game = Game()
-game.play()
+game.train()
