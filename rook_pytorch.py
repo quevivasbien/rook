@@ -14,7 +14,12 @@ from time import time
 
 
 LR = 0.10  # the learning rate
-DECAY_RATE = 0.005  # exponential decay for learning rate, set to 0 for no decay
+DECAY_RATE = 0.001  # exponential decay for learning rate, set to 0 for no decay
+# parameters for adam optimization
+BETA1 = 0.9
+BETA2 = 0.999
+EPSILON = 1e-6
+
 VERBOSE = False
 
 def printv(text):
@@ -103,6 +108,10 @@ class ChoiceNN(nn.Module):
         super().__init__()
         self.relu = nn.ReLU()
         self.softmax = nn.Softmax(dim=-1)
+        self.cached_grads = None
+        self.m = self.get_zeros()
+        self.v = self.get_zeros()
+        self.t = 0
     
     def get_zeros(self):
         return [torch.zeros_like(p) for p in self.parameters()]
@@ -113,6 +122,26 @@ class ChoiceNN(nn.Module):
         except AttributeError:
             # gradients do not exist, return tensors of zeros instead
             return self.get_zeros()
+    
+    def get_cached_grads(self):
+        if self.cached_grads is None:
+            self.cached_grads = self.get_zeros()
+        return self.cached_grads
+    
+    def cache_grads(self):
+        new_grads = self.get_grads()
+        for i, g in enumerate(self.get_cached_grads()):
+            g += new_grads[i]
+        self.zero_grad()
+    
+    def adam_update(self, step_size=-1):
+        self.t += 1
+        for m, v, g, p in zip(self.m, self.v, self.get_cached_grads(), self.parameters()):
+            m = BETA1 * m + (1 - BETA1) * g
+            mhat = m / (1 - BETA1**self.t)
+            v = BETA2 * v + (1 - BETA2) * torch.pow(g, 2)
+            vhat = v / (1 - BETA2)**self.t
+            p.data += step_size * mhat / (torch.sqrt(vhat) + EPSILON)
 
     def forward(self, input_features):
         raise NotImplementedError
@@ -170,19 +199,12 @@ class Game:
     def __init__(self):
         # set up neural nets
         self.chooseTrump = ChooseTrump()
-        self.trump_grad = self.chooseTrump.get_grads()
         self.chooseWidow = ChooseCard(61)  # input dim is 4 + 57
-        self.widow_grad = self.chooseWidow.get_grads()
         self.chooseBid = ChooseBid()
-        self.bid_grad = self.chooseBid.get_grads()
         self.firstPlayerChooseCard = ChooseCard(118)  # input dim is 4 + 2*57
-        self.grad1 = self.firstPlayerChooseCard.get_grads()
         self.secondPlayerChooseCard = ChooseCard(175)  # input dim is 4 + 3*57
-        self.grad2 = self.secondPlayerChooseCard.get_grads()
         self.thirdPlayerChooseCard = ChooseCard(175)
-        self.grad3 = self.thirdPlayerChooseCard.get_grads()
         self.fourthPlayerChooseCard = ChooseCard(118)
-        self.grad4 = self.fourthPlayerChooseCard.get_grads()
         # set up the game state to be ready for the start of the game
         self.reset()
     
@@ -226,10 +248,7 @@ class Game:
             action_vec = self.chooseBid(all_features)
             # update gradients
             action_vec.max().backward()
-            new_grads = self.chooseBid.get_grads()
-            for j, g in enumerate(self.bid_grad):
-                g += new_grads[j]
-            self.chooseBid.zero_grad()
+            self.chooseBid.cache_grads()
             # Interpret action
             # Possible actions are pass (0), bid up 5 (1), or bid up 10 (2)
             action = action_vec.argmax()
@@ -264,23 +283,18 @@ class Game:
         trump_color_vec = self.chooseTrump(all_cards_vec)
         # update gradients for chooseTrump neural net
         trump_color_vec.max().backward()
-        new_grads = self.chooseTrump.get_grads()
-        for i, g in enumerate(self.trump_grad):
-            g += new_grads[i]
-        self.chooseTrump.zero_grad()
+        self.chooseTrump.cache_grads()
         # Set self.trump
         max_idx = trump_color_vec.argmax()
         self.trump = 'red' if max_idx == 0 else 'yellow' if max_idx == 1 else 'green' if max_idx == 2 else 'black'
         # Now choose cards to put back in the widow
         widow_vec = self.chooseWidow(torch.cat((color_to_one_hot(self.trump), all_cards_vec)))
-        # update gradients...
-        new_grads = self.chooseWidow.get_grads()
-        for i, g in enumerate(self.widow_grad):
-            g += new_grads[i]
-        self.chooseWidow.zero_grad()
-        # Set widow and player's hand
         allowed = all_cards_vec * widow_vec.detach()
         choice_idxs = torch.topk(allowed, 5).indices
+        # update gradients...
+        widow_vec[choice_idxs].mean().backward()
+        self.chooseWidow.cache_grads()
+        # Set widow and player's hand
         choice_dicts = [card_from_index(idx.item()).__dict__ for idx in choice_idxs]
         self.widow = [card for card in all_cards if card.__dict__ in choice_dicts]
         self.players[self.bid_winner] = [card for card in all_cards if card not in self.widow]
@@ -365,31 +379,18 @@ class Game:
         # update the gradients determining that card
         card_choice_vec[best_card_index].backward()
         if num_cards_down == 0:
-            new_grads = self.firstPlayerChooseCard.get_grads()
-            for i, g in enumerate(self.grad1):
-                g += new_grads[i]
-            self.firstPlayerChooseCard.zero_grad()
+            self.firstPlayerChooseCard.cache_grads()
         elif num_cards_down == 1:
-            new_grads = self.secondPlayerChooseCard.get_grads()
-            for i, g in enumerate(self.grad2):
-                g += new_grads[i]
-            self.secondPlayerChooseCard.zero_grad()
+            self.secondPlayerChooseCard.cache_grads()
         elif num_cards_down == 2:
-            new_grads = self.thirdPlayerChooseCard.get_grads()
-            for i, g in enumerate(self.grad3):
-                g += new_grads[i]
-            self.thirdPlayerChooseCard.zero_grad()
+            self.thirdPlayerChooseCard.cache_grads()
         elif num_cards_down == 3:
-            new_grads = self.fourthPlayerChooseCard.get_grads()
-            for i, g in enumerate(self.grad4):
-                g += new_grads[i]
-            self.fourthPlayerChooseCard.zero_grad()
+            self.fourthPlayerChooseCard.cache_grads()
         # interpret the best card index as a Card and update the game state
         choice_dict = card_from_index(best_card_index).__dict__
         for i, card in enumerate(self.players[player]):
             if card.__dict__ == choice_dict:
                 return self.players[player].pop(i)
-        assert False, f'shouldn\'t arrive here! player is {player} and card is {choice_dict}'
 
     def play_hand(self, starting_player):
         player_order = [(i+starting_player) % 4 for i in range(4)]
@@ -436,29 +437,15 @@ class Game:
             # update neural net parameters based on acccumulated gradients & who won the game
             # if a player won, reinforce the params based on the grad, otherwise do opposite
             sign = 1 if self.score0 > self.score1 else -1 if self.score0 < self.score1 else 0
-            for p, grad in zip(self.firstPlayerChooseCard.parameters(), self.grad1):
-                p.data += (sign * LR * decay * grad)
-            self.grad1 = self.firstPlayerChooseCard.get_zeros()
-            for p, grad in zip(self.secondPlayerChooseCard.parameters(), self.grad2):
-                p.data -= (sign * LR * decay * grad)
-            self.grad2 = self.secondPlayerChooseCard.get_zeros()
-            for p, grad in zip(self.thirdPlayerChooseCard.parameters(), self.grad3):
-                p.data += (sign * LR * decay * grad)
-            self.grad3 = self.thirdPlayerChooseCard.get_zeros()
-            for p, grad in zip(self.fourthPlayerChooseCard.parameters(), self.grad4):
-                p.data -= (sign * LR * decay * grad)
-            self.grad4 = self.fourthPlayerChooseCard.get_zeros()
+            self.firstPlayerChooseCard.adam_update(sign * LR * decay)
+            self.secondPlayerChooseCard.adam_update(-1 * sign * LR * decay)
+            self.thirdPlayerChooseCard.adam_update(sign * LR * decay)
+            self.fourthPlayerChooseCard.adam_update(-1 * sign * LR * decay)
             # update params from pre-game phase
             sign *= (1 if self.bid_winner % 2 == 0 else -1)
-            for p, grad in zip(self.chooseBid.parameters(), self.bid_grad):
-                p.data += (sign * LR * decay * grad)
-            self.bid_grad = self.chooseBid.get_zeros()
-            for p, grad in zip(self.chooseTrump.parameters(), self.trump_grad):
-                p.data += (sign * LR * decay * grad)
-            self.trump_grad = self.chooseTrump.get_zeros()
-            for p, grad in zip(self.chooseWidow.parameters(), self.widow_grad):
-                p.data += (sign * LR * decay * grad)
-            self.widow_grad = self.chooseWidow.get_zeros()
+            self.chooseBid.adam_update(sign * LR * decay)
+            self.chooseTrump.adam_update(sign * LR * decay)
+            self.chooseWidow.adam_update(sign * LR * decay)
         # reset the game state to play again
         self.reset()
     
