@@ -8,23 +8,21 @@ Teaching a computer to play Rook card game with adversarial neural networks
 import random
 import torch
 import torch.nn as nn
+import pickle
 
 from math import exp
 from time import time
 
 
-LR = 0.10  # the learning rate
+MAX_LR = 0.10  # the learning rate
+MIN_LR = 0.001
 DECAY_RATE = 0.001  # exponential decay for learning rate, set to 0 for no decay
 # parameters for adam optimization
 BETA1 = 0.9
 BETA2 = 0.999
 EPSILON = 1e-6
 
-VERBOSE = False
-
-def printv(text):
-    if VERBOSE:
-        print(text)
+PARAMS = 'params.pkl'
 
 
 
@@ -109,8 +107,6 @@ class ChoiceNN(nn.Module):
         self.relu = nn.ReLU()
         self.softmax = nn.Softmax(dim=-1)
         self.cached_grads = None
-        self.m = self.get_zeros()
-        self.v = self.get_zeros()
         self.t = 0
     
     def get_zeros(self):
@@ -135,13 +131,21 @@ class ChoiceNN(nn.Module):
         self.zero_grad()
     
     def adam_update(self, step_size=-1):
+        if self.t == 0:
+            self.m = self.get_zeros()
+            self.v = self.get_zeros()
         self.t += 1
         for m, v, g, p in zip(self.m, self.v, self.get_cached_grads(), self.parameters()):
             m = BETA1 * m + (1 - BETA1) * g
             mhat = m / (1 - BETA1**self.t)
             v = BETA2 * v + (1 - BETA2) * torch.pow(g, 2)
             vhat = v / (1 - BETA2)**self.t
-            p.data += step_size * mhat / (torch.sqrt(vhat) + EPSILON)
+            update = step_size * mhat / (torch.sqrt(vhat) + EPSILON)
+            # check for nans before updating
+            if not torch.isnan(update).any():
+                p.data += update
+        # reset cached gradients
+        self.cached_grads = self.get_zeros()
 
     def forward(self, input_features):
         raise NotImplementedError
@@ -182,8 +186,8 @@ class ChooseCard(ChoiceNN):
     
     def __init__(self, input_dim):
         super().__init__()
-        self.l1 = nn.Linear(input_dim, 100)
-        self.l2 = nn.Linear(100, 75)
+        self.l1 = nn.Linear(input_dim, int(input_dim*1.25))
+        self.l2 = nn.Linear(int(input_dim*1.25), 75)
         self.l3 = nn.Linear(75, 57)
     
     def forward(self, input_features):
@@ -196,17 +200,60 @@ class ChooseCard(ChoiceNN):
 
 class Game:
 
-    def __init__(self):
+    def __init__(self, load_params=False, verbose=False):
+        """The basic game object that controls players, cards, & player decisions and plays games
+
+        Parameters
+        ----------
+        load_params : bool, optional
+            Whether to load starting parameters from a file instead of using random values. The default is False.
+        verbose : bool, optional
+            Whether to print game state updates while running. The default is False.
+
+        """
         # set up neural nets
         self.chooseTrump = ChooseTrump()
         self.chooseWidow = ChooseCard(61)  # input dim is 4 + 57
         self.chooseBid = ChooseBid()
-        self.firstPlayerChooseCard = ChooseCard(118)  # input dim is 4 + 2*57
-        self.secondPlayerChooseCard = ChooseCard(175)  # input dim is 4 + 3*57
-        self.thirdPlayerChooseCard = ChooseCard(175)
-        self.fourthPlayerChooseCard = ChooseCard(118)
+        # card choice nets for even team
+        self.firstEvenChooseCard = ChooseCard(118)  # input dim is 4 + 2*57
+        self.secondEvenChooseCard = ChooseCard(175)  # input dim is 4 + 3*57
+        self.thirdEvenChooseCard = ChooseCard(175)
+        self.fourthEvenChooseCard = ChooseCard(118)
+        # card choice nets for odd team
+        self.firstOddChooseCard = ChooseCard(118)
+        self.secondOddChooseCard = ChooseCard(175)
+        self.thirdOddChooseCard = ChooseCard(175)
+        self.fourthOddChooseCard = ChooseCard(118)
+        if load_params:
+            self.load_params()
         # set up the game state to be ready for the start of the game
         self.reset()
+        # create game_balance list to keep track of which team is winning the most games
+        self.game_balance = []
+        # set verbose param to determine whether to print game state updates
+        self.verbose = verbose
+        
+    def load_params(self):
+        with open(PARAMS, 'rb') as fh:
+            params = pickle.load(fh)
+        for obj, params_ in zip((self.chooseTrump, self.chooseWidow, self.chooseBid, self.firstEvenChooseCard,
+                                 self.secondEvenChooseCard, self.thirdEvenChooseCard, self.fourthEvenChooseCard,
+                                 self.firstOddChooseCard, self.secondOddChooseCard, self.thirdOddChooseCard,
+                                 self.fourthOddChooseCard),
+                                params):
+            for p, param in zip(obj.parameters(), params_):
+                p.data = param
+        
+    def dump_params(self):
+        params = []
+        for obj in (self.chooseTrump, self.chooseWidow, self.chooseBid, self.firstEvenChooseCard,
+                    self.secondEvenChooseCard, self.thirdEvenChooseCard, self.fourthEvenChooseCard,
+                    self.firstOddChooseCard, self.secondOddChooseCard, self.thirdOddChooseCard,
+                    self.fourthOddChooseCard):
+            params.append([p.data for p in obj.parameters()])
+        with open(PARAMS, 'wb') as fh:
+            pickle.dump(params, fh)
     
     def reset(self):
         # create list of all cards in the deck
@@ -332,6 +379,20 @@ class Game:
         return vectorize_cards(cards_in_hand)
         
     def choose_card(self, cards, player_order):
+        """Choose a card to play.
+
+        Parameters
+        ----------
+        cards : list of Card objects
+            The cards that have already been played in the given hand (should have length from 0 to 3).
+        player_order : list of ints
+            The player order for the given round of play. Should be some ordered permutation of [0, 1, 2, 3].
+
+        Returns
+        -------
+        Card object -- the card from the player's hand to be played.
+
+        """
         num_cards_down = len(cards)
         player = player_order[num_cards_down]
         # Have a separate neural network for each num_cards_down
@@ -348,7 +409,8 @@ class Game:
             if player != self.bid_winner:
                 possible_plays += vectorize_cards(self.widow)
             input_features = torch.cat((self.trump_vec, cards_in_hand, possible_plays))
-            card_choice_vec = self.firstPlayerChooseCard(input_features)
+            card_choice_vec = self.firstEvenChooseCard(input_features) if player % 2 == 0 \
+                                else self.firstOddChooseCard(input_features)
         elif num_cards_down == 1:
             possible_plays = vectorize_cards(sum(
                         (self.players[p] for p in player_order[2:]), []
@@ -357,18 +419,21 @@ class Game:
                 possible_plays += vectorize_cards(self.widow)
             cards_down = vectorize_cards(cards)
             input_features = torch.cat((self.trump_vec, cards_in_hand, possible_plays, cards_down))
-            card_choice_vec = self.secondPlayerChooseCard(input_features)
+            card_choice_vec = self.secondEvenChooseCard(input_features) if player % 2 == 0 \
+                                else self.secondOddChooseCard(input_features)
         elif num_cards_down == 2:
             possible_plays = vectorize_cards(self.players[player_order[3]])
             if player != self.bid_winner:
                 possible_plays += vectorize_cards(self.widow)
             cards_down = vectorize_cards(cards)
             input_features = torch.cat((self.trump_vec, cards_in_hand, possible_plays, cards_down))
-            card_choice_vec = self.thirdPlayerChooseCard(input_features)
+            card_choice_vec = self.thirdEvenChooseCard(input_features) if player % 2 == 0 \
+                                else self.thirdOddChooseCard(input_features)
         elif num_cards_down == 3:
             cards_down = vectorize_cards(cards)
             input_features = torch.cat((self.trump_vec, cards_in_hand, cards_down))
-            card_choice_vec = self.fourthPlayerChooseCard(input_features)
+            card_choice_vec = self.fourthEvenChooseCard(input_features) if player % 2 == 0 \
+                                else self.fourthOddChooseCard(input_features)
         # determine the best available card from card_choice_vec
         available_plays = card_choice_vec.detach().clone()
         if num_cards_down == 0:
@@ -379,26 +444,43 @@ class Game:
         # update the gradients determining that card
         card_choice_vec[best_card_index].backward()
         if num_cards_down == 0:
-            self.firstPlayerChooseCard.cache_grads()
+            if player % 2 == 0:
+                self.firstEvenChooseCard.cache_grads()
+            else:
+                self.firstOddChooseCard.cache_grads()
         elif num_cards_down == 1:
-            self.secondPlayerChooseCard.cache_grads()
+            if player % 2 == 0:
+                self.secondEvenChooseCard.cache_grads()
+            else:
+                self.secondOddChooseCard.cache_grads()
         elif num_cards_down == 2:
-            self.thirdPlayerChooseCard.cache_grads()
+            if player % 2 == 0:
+                self.thirdEvenChooseCard.cache_grads()
+            else:
+                self.thirdOddChooseCard.cache_grads()
         elif num_cards_down == 3:
-            self.fourthPlayerChooseCard.cache_grads()
+            if player % 2 == 0:
+                self.fourthEvenChooseCard.cache_grads()
+            else:
+                self.fourthOddChooseCard.cache_grads()
         # interpret the best card index as a Card and update the game state
         choice_dict = card_from_index(best_card_index).__dict__
         for i, card in enumerate(self.players[player]):
             if card.__dict__ == choice_dict:
                 return self.players[player].pop(i)
+        assert False, (available_plays, choice_dict, [c.__dict__ for c in self.players[player]])
 
     def play_hand(self, starting_player):
+        """Goes through a hand of play (all four players play a single card)
+        starting_player is an int from 0 to 3 inclusive denoting which player plays first in the hand
+        """
         player_order = [(i+starting_player) % 4 for i in range(4)]
         cards = []
         for player in player_order:
             cards.append(self.choose_card(cards, player_order))
-            printv(f'player {player} plays rook' if isinstance(cards[-1], Rook) else \
-                   f'player {player} plays {cards[-1].color} {cards[-1].number}')
+            if self.verbose:
+                print(f'player {player} plays rook' if isinstance(cards[-1], Rook) else \
+                      f'player {player} plays {cards[-1].color} {cards[-1].number}')
         winner, points = self.resolve_hand(cards, player_order)
         if winner % 2 == 0:
             self.score0 += points
@@ -407,11 +489,24 @@ class Game:
         return winner
 
     def play(self, train=False, decay=1):
-        printv(f'Player {self.bid_winner} won the bid for {self.bid_amount}.')
-        printv(f'{self.trump} is trump')
+        """Play a game (consisting of bidding and 13 rounds of play)
+
+        Parameters
+        ----------
+        train : bool, optional
+            Whether to update parameters based on the game's outcome. The default is False.
+        decay : float [between 0 and 1], optional
+            The learning rate decay to use for updating parameters. Only applicable if train is True.
+            The default is 1 (i.e. no decay).
+
+        """
+        if self.verbose:
+            print(f'Player {self.bid_winner} won the bid for {self.bid_amount}.')
+            print(f'{self.trump} is trump')
         starting_player = self.bid_winner
         for i in range(13):
-            printv(f'Round {i+1}:')
+            if self.verbose:
+                print(f'Round {i+1}:')
             starting_player = self.play_hand(starting_player)
         # take points from widow
         if starting_player % 2 == 0:
@@ -429,35 +524,56 @@ class Game:
             self.score0 -= self.bid_amount
         elif self.bid_winner == 1 or self.bid_winner == 3 and self.score1 < self.bid_amount:
             self.score1 -= self.bid_amount
-        printv(f'Score is {self.score0} to {self.score1}.')
-        printv('Even team wins.' if self.score0 > self.score1 else \
-               'Odd team wins.' if self.score0 < self.score1 else \
-               'It\'s a tie.')
+        if self.verbose:
+            print(f'Score is {self.score0} to {self.score1}.')
+            print('Even team wins.' if self.score0 > self.score1 else \
+                  'Odd team wins.' if self.score0 < self.score1 else \
+                  'It\'s a tie.')
         if train:
+            lr = max(MAX_LR * decay, MIN_LR)
             # update neural net parameters based on acccumulated gradients & who won the game
             # if a player won, reinforce the params based on the grad, otherwise do opposite
             sign = 1 if self.score0 > self.score1 else -1 if self.score0 < self.score1 else 0
-            self.firstPlayerChooseCard.adam_update(sign * LR * decay)
-            self.secondPlayerChooseCard.adam_update(-1 * sign * LR * decay)
-            self.thirdPlayerChooseCard.adam_update(sign * LR * decay)
-            self.fourthPlayerChooseCard.adam_update(-1 * sign * LR * decay)
+            self.firstEvenChooseCard.adam_update(sign * lr)
+            self.secondEvenChooseCard.adam_update(sign * lr)
+            self.thirdEvenChooseCard.adam_update(sign * lr)
+            self.fourthEvenChooseCard.adam_update(sign * lr)
+            self.firstOddChooseCard.adam_update(-1 * sign * lr)
+            self.secondOddChooseCard.adam_update(-1 * sign * lr)
+            self.thirdOddChooseCard.adam_update(-1 * sign * lr)
+            self.fourthOddChooseCard.adam_update(-1 * sign * lr)
             # update params from pre-game phase
             sign *= (1 if self.bid_winner % 2 == 0 else -1)
-            self.chooseBid.adam_update(sign * LR * decay)
-            self.chooseTrump.adam_update(sign * LR * decay)
-            self.chooseWidow.adam_update(sign * LR * decay)
+            self.chooseBid.adam_update(sign * lr)
+            self.chooseTrump.adam_update(sign * lr)
+            self.chooseWidow.adam_update(sign * lr)
+        # record game outcome
+        self.game_balance.append(int(self.score0 > self.score1) if self.score0 != self.score1 else 0.5)
         # reset the game state to play again
         self.reset()
     
-    def train(self, rounds=100):
+    def train(self, rounds=1000, dump=True):
+        """Train the associated neural networks by playing games against themselves.
+
+        Parameters
+        ----------
+        rounds : [positive] int, optional
+            The number of training rounds to play. It takes about 5 sec for each 100 rounds. The default is 10000.
+        dump : bool, optional
+            Whether to save the post-training neural net parameters to a file that can be loaded later.
+            The default is True.
+
+        """
         time0 = time()
         for i in range(rounds):
             self.play(train=True, decay=(exp(-i*DECAY_RATE)))
             if (i+1) % 100 == 0 or (i+1) == rounds:
                 print(f'Completed {i+1} / {rounds} training rounds (average {(time()-time0)*10:.2f} ms per round).')
                 time0 = time()
+        if dump:
+            self.dump_params()
 
 
 
 game = Game()
-game.train(10000)
+game.train()
